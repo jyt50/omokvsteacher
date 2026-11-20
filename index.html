@@ -363,6 +363,13 @@ text.coord { font-size: 14px; fill: #5b4320; font-weight: 700; }
 [hidden] { display: none !important; }
 .status-banner .cd-num, .status-banner .cd-paused { font-size: inherit; color: inherit; }
 .status-banner .cd-paused { font-size: 0.8rem; color: var(--warn); }
+.form.compact { gap: 8px; }
+.form.compact label { font-size: 0.85rem; }
+.form.compact select { min-height: 38px; padding: 0.4em 0.6em; font-size: 0.9rem; }
+.tie-options { display: flex; flex-direction: column; gap: 8px; margin: 6px 0; }
+.tie-options .btn { display: flex; flex-direction: column; align-items: flex-start; text-align: left; gap: 2px; }
+.tie-options .btn small { font-weight: 500; opacity: 0.8; font-size: 0.78rem; }
+svg.board * { pointer-events: none; }
 
 </style>
 </head>
@@ -426,7 +433,12 @@ class Room {
     this.bannedTokens = new Set();
     this.participantSeq = 0;
     this.voteSeq = 0;
-    this.settings = { voteSeconds: CONFIG.defaultVoteSeconds, firstTeam: TEACHER, autoStartVote: true };
+    this.settings = {
+      voteSeconds: CONFIG.defaultVoteSeconds,
+      studentColor: 'W', // 학생 팀 돌 색 ('B' 흑돌 = 먼저 둠, 'W' 백돌)
+      autoStartVote: true,
+      liveTally: 'teacher', // 투표 중 득표 현황 표시: 'teacher' 교사만 | 'all' 모두 | 'none' 표시 안 함
+    };
     this.gameNo = 0;
     this.timer = null;
     this.resetGame();
@@ -480,10 +492,10 @@ class Room {
   }
   start() {
     if (this.phase !== 'lobby') fail('대기 상태에서만 게임을 시작할 수 있습니다. 먼저 초기화해 주세요.');
-    const first = this.settings.firstTeam;
-    const second = first === TEACHER ? STUDENTS : TEACHER;
-    this.teamColor = { [first]: 'B', [second]: 'W' };
-    this.turn = first;
+    // 오목은 흑돌이 먼저 둔다
+    const sc = this.settings.studentColor;
+    this.teamColor = { [STUDENTS]: sc, [TEACHER]: sc === 'B' ? 'W' : 'B' };
+    this.turn = sc === 'B' ? STUDENTS : TEACHER;
     this.phase = 'playing';
     this.maybeAutoVote();
   }
@@ -517,10 +529,14 @@ class Room {
       if (!CONFIG.voteSecondsOptions.includes(patch.voteSeconds)) fail('투표 시간은 10, 15, 20, 30, 60초 중에서 선택해 주세요.');
       next.voteSeconds = patch.voteSeconds;
     }
-    if (patch.firstTeam !== undefined) {
-      if (![TEACHER, STUDENTS].includes(patch.firstTeam)) fail('잘못된 선공 팀입니다.');
-      if (this.phase !== 'lobby') fail('선공 팀은 게임 시작 전에만 바꿀 수 있습니다.');
-      next.firstTeam = patch.firstTeam;
+    if (patch.studentColor !== undefined) {
+      if (!['B', 'W'].includes(patch.studentColor)) fail('잘못된 돌 색입니다.');
+      if (this.phase !== 'lobby') fail('돌 색은 게임 시작 전(대기 중)에만 바꿀 수 있습니다.');
+      next.studentColor = patch.studentColor;
+    }
+    if (patch.liveTally !== undefined) {
+      if (!['teacher', 'all', 'none'].includes(patch.liveTally)) fail('잘못된 표시 설정입니다.');
+      next.liveTally = patch.liveTally;
     }
     if (patch.autoStartVote !== undefined) next.autoStartVote = !!patch.autoStartVote;
     this.settings = next;
@@ -665,15 +681,19 @@ class Room {
     this.placeStone(STUDENTS, tied[0], { by: 'vote', votes: top, totalVotes });
     return true;
   }
-  resolveTie(cell) {
+  /** 동점 후보 중 무작위로 결정 */
+  randomTie() {
     this.requirePlaying();
     if (this.vote?.status !== 'tie') fail('동점 결정 대기 상태가 아닙니다.');
-    if (!this.vote.tieCells.includes(cell)) fail('동점 후보 좌표 중에서 선택해 주세요.');
-    this.requireEmpty(cell);
+    const cells = this.vote.tieCells.filter((c) => this.board[c] === null);
+    const r = new Uint32Array(1);
+    crypto.getRandomValues(r);
+    const cell = cells[r[0] % cells.length];
     const res = this.lastVoteResult;
     const votes = res?.tally.find((t) => t.cell === cell)?.count ?? 0;
-    if (res) Object.assign(res, { chosen: cell, decidedBy: 'teacher-tie', status: 'decided' });
-    this.placeStone(STUDENTS, cell, { by: 'teacher-tie', votes, totalVotes: res?.totalVotes ?? 0 });
+    if (res) Object.assign(res, { chosen: cell, decidedBy: 'random-tie', status: 'decided' });
+    this.placeStone(STUDENTS, cell, { by: 'random-tie', votes, totalVotes: res?.totalVotes ?? 0, candidates: cells.map(cellLabel) });
+    return cell;
   }
   runoff() {
     this.requirePlaying();
@@ -725,7 +745,9 @@ class Room {
       remainingMs,
       votedCount: [...v.ballots.keys()].filter((id) => this.participants.has(id)).length,
     };
-    if (host && v.status === 'open') view.liveTally = this.tally(); // 득표 현황은 교사에게만
+    // 투표 중 득표 현황: 설정에 따라 교사만 / 모두 / 아무에게도 보내지 않음
+    const show = this.settings.liveTally;
+    if (v.status === 'open' && (show === 'all' || (host && show === 'teacher'))) view.liveTally = this.tally();
     return view;
   }
   publicState() {
@@ -740,7 +762,7 @@ class Room {
       lastMove: this.lastMove,
       moves: this.moves,
       result: this.result,
-      settings: { voteSeconds: this.settings.voteSeconds, firstTeam: this.settings.firstTeam },
+      settings: { voteSeconds: this.settings.voteSeconds, studentColor: this.settings.studentColor, liveTally: this.settings.liveTally },
       students: { online: this.onlineStudentCount(), total: this.participants.size },
       vote: this.voteView({ host: false }),
       lastVoteResult: this.lastVoteResult,
@@ -799,7 +821,7 @@ class Room {
       createdAt: data.createdAt,
       participantSeq: data.participantSeq,
       voteSeq: data.voteSeq,
-      settings: data.settings,
+      settings: { ...room.settings, ...data.settings },
       gameNo: data.gameNo,
       phase: data.phase,
       board: data.board,
@@ -811,6 +833,8 @@ class Room {
       lastVoteResult: data.lastVoteResult,
       bannedTokens: new Set(data.bannedTokens),
     });
+    if (data.settings?.firstTeam && !data.settings.studentColor) room.settings.studentColor = data.settings.firstTeam === STUDENTS ? 'B' : 'W';
+    delete room.settings.firstTeam;
     for (const p of data.participants) {
       room.participants.set(p.id, { ...p, sockets: new Set(), lastSeen: 0 });
       room.tokenIndex.set(p.token, p.id);
@@ -912,10 +936,19 @@ function resultText(result) {
   if (result.reason === 'stopped') return '선생님이 게임을 종료했습니다.';
   return `${TEAM_NAME[result.winner]} 승리!`;
 }
+const LIVE_TALLY_TEXT = { teacher: '교사 화면에만 표시', all: '교사·학생 화면 모두 표시', none: '아무 화면에도 표시 안 함' };
+const colorSelectHTML = (st, disabled) =>
+  `<label>학생 팀 돌 색 <span class="muted small">(흑돌이 먼저 둡니다)</span><select data-change="studentColor" ${disabled ? 'disabled' : ''}><option value="B" ${st.settings.studentColor === 'B' ? 'selected' : ''}>학생 팀 흑돌 (학생이 먼저) · 선생님 백돌</option><option value="W" ${st.settings.studentColor === 'W' ? 'selected' : ''}>학생 팀 백돌 · 선생님 흑돌 (선생님이 먼저)</option></select></label>`;
+const liveSelectHTML = (st) =>
+  `<label>투표 중 득표 현황 (확정 전 표)<select data-change="liveTally">${Object.entries(LIVE_TALLY_TEXT)
+    .map(([k, v]) => `<option value="${k}" ${st.settings.liveTally === k ? 'selected' : ''}>${v}</option>`)
+    .join('')}</select></label>`;
+
 function moveByText(m) {
   if (m.by === 'teacher') return '선생님';
   if (m.by === 'vote') return `투표 ${m.votes}/${m.totalVotes}표`;
   if (m.by === 'teacher-tie') return `동점 → 선생님 결정 (${m.votes}표)`;
+  if (m.by === 'random-tie') return `동점 → 무작위 결정 (${m.votes}표)`;
   if (m.by === 'teacher-direct') return '선생님이 대신 착수';
   return '';
 }
@@ -954,8 +987,7 @@ const STATIC_BOARD = (() => {
 
 function boardSVG({ role, board, lastMove, winLine, marks = {}, highlight = null, myCell = null, selectedCell = null, ghostColor = null, clickable = false }) {
   const win = new Set(winLine || []);
-  let s = `<svg class="board ${clickable ? 'is-pointer' : ''}" data-role="${role}" viewBox="0 0 ${VIEW} ${VIEW}" role="img" aria-label="15×15 오목판">`;
-  s += `<defs><radialGradient id="gB" cx="35%" cy="35%" r="65%"><stop offset="0%" stop-color="#666"/><stop offset="100%" stop-color="#111"/></radialGradient>`;
+  let s = `<defs><radialGradient id="gB" cx="35%" cy="35%" r="65%"><stop offset="0%" stop-color="#666"/><stop offset="100%" stop-color="#111"/></radialGradient>`;
   s += `<radialGradient id="gW" cx="35%" cy="35%" r="70%"><stop offset="0%" stop-color="#fff"/><stop offset="100%" stop-color="#d9d9d9"/></radialGradient></defs>`;
   s += STATIC_BOARD;
   for (const c of highlight || []) {
@@ -982,7 +1014,23 @@ function boardSVG({ role, board, lastMove, winLine, marks = {}, highlight = null
     const w = Math.max(22, 10 + String(m.text).length * 9);
     s += `<g class="mark ${m.tone === 'tie' ? 'mark-tie' : ''}"><rect x="${x - w / 2}" y="${y - 11}" width="${w}" height="22" rx="11"/><text x="${x}" y="${y + 5}" text-anchor="middle">${esc(m.text)}</text></g>`;
   }
-  return `${s}</svg>`;
+  return { role, clickable, inner: s };
+}
+
+/** 오목판 요소(svg)는 유지하고 내용만 교체 → 그리는 도중 누른 터치도 놓치지 않음 */
+function patchBoard(id, { role, clickable, inner }) {
+  const box = document.getElementById(id);
+  if (!box) return;
+  let svg = box.querySelector('svg.board');
+  if (!svg) {
+    box.innerHTML = `<svg class="board" data-role="${role}" viewBox="0 0 ${VIEW} ${VIEW}" role="img" aria-label="15×15 오목판"></svg>`;
+    svg = box.querySelector('svg.board');
+  }
+  svg.classList.toggle('is-pointer', clickable);
+  if (svg.__inner !== inner) {
+    svg.innerHTML = inner;
+    svg.__inner = inner;
+  }
 }
 
 function cellFromClick(svg, e) {
@@ -1020,7 +1068,12 @@ function voteResultHTML(r) {
   else if (r.status === 'tie') headline = '동점입니다! 선생님이 결정합니다.';
   else if (r.chosen !== null) {
     const label = cellLabel(r.chosen);
-    headline = r.decidedBy === 'teacher-tie' ? `동점 중 선생님이 ${label}을(를) 선택했습니다.` : `최종 결정: ${label}`;
+    headline =
+      r.decidedBy === 'random-tie'
+        ? `동점 후보 중 무작위로 ${label}이(가) 뽑혔습니다.`
+        : r.decidedBy === 'teacher-tie'
+          ? `동점 중 선생님이 ${label}을(를) 선택했습니다.`
+          : `최종 결정: ${label}`;
   }
   const invalid = Math.max(0, r.eligible - r.totalVotes);
   return `<section class="card"><h3>투표 결과 ${r.round > 1 ? '<span class="badge">재투표</span>' : ''}</h3><p class="result-headline">${headline}</p><p class="muted small">투표 ${r.totalVotes}명 · 무효(미투표) ${invalid}명</p>${tallyHTML(r.tally, r.totalVotes, r.chosen, 6)}</section>`;
@@ -1060,7 +1113,7 @@ const Host = {
   isNewRoom: true,
   openAttempts: 0,
   saveTimer: null,
-  ui: { selected: null, directMode: false, hideTally: false, tab: 'students', overlayHiddenFor: null, error: '', turnKey: '' },
+  ui: { selected: null, directMode: false, tab: 'students', overlayHiddenFor: null, error: '', turnKey: '' },
 
   async start(snapshot) {
     const Peer = await getPeerClass();
@@ -1288,7 +1341,7 @@ const Host = {
         case 'settings': room.setSettings(extra); break;
         case 'place': room.teacherPlace(extra.cell); break;
         case 'placeForStudents': room.placeForStudents(extra.cell); break;
-        case 'resolveTie': room.resolveTie(extra.cell); break;
+        case 'randomTie': room.randomTie(); break;
         case 'startVote': room.revote(); break;
         case 'runoff': room.runoff(); break;
         case 'extendVote': room.extendVote(10); break;
@@ -1710,13 +1763,12 @@ function renderTeacher(force = false) {
   // 오목판
   let mode = null;
   if (playing && turn === 'teacher') mode = 'place';
-  else if (playing && turn === 'students' && vote?.status === 'tie') mode = 'tie';
   else if (playing && turn === 'students' && ui.directMode) mode = 'direct';
   Host.mode = mode;
   const marks = {};
-  if (vote?.status === 'open' && vote.liveTally && !ui.hideTally) for (const t of vote.liveTally) marks[t.cell] = { text: t.count };
+  if (vote?.status === 'open' && vote.liveTally) for (const t of vote.liveTally) marks[t.cell] = { text: t.count };
   if (vote?.status === 'tie' && st.lastVoteResult) for (const t of st.lastVoteResult.tally) if (vote.tieCells.includes(t.cell)) marks[t.cell] = { text: t.count, tone: 'tie' };
-  patch(
+  patchBoard(
     't-board',
     boardSVG({
       role: 'teacher',
@@ -1736,7 +1788,6 @@ function renderTeacher(force = false) {
     if (ui.selected === null) {
       const hint = {
         place: `선생님 차례: 둘 자리를 누른 뒤 확정하세요 (${teamColor.teacher === 'B' ? '흑돌' : '백돌'})`,
-        tie: '동점 후보(점선) 중 하나를 눌러 학생 팀의 수를 결정하세요.',
         direct: '학생 팀 돌을 직접 둘 자리를 누르세요. (진행 중인 투표는 취소됩니다)',
       }[mode];
       confirm = `<div class="confirm-bar"><span>${hint}</span></div>`;
@@ -1765,17 +1816,26 @@ function renderTeacher(force = false) {
     if (vote?.status === 'open') {
       vc += `${countdownHTML()}<p class="vote-count">투표 <b>${vote.votedCount}</b> / 접속 ${st.students.online}명</p>
         <div class="row-btns"><button class="btn primary" data-act="h" data-type="closeVote" ${playing ? '' : 'disabled'}>즉시 마감</button><button class="btn" data-act="h" data-type="extendVote">+10초</button></div>
-        <label class="check small"><input type="checkbox" data-change="hideTally" ${ui.hideTally ? 'checked' : ''}> 득표수 숨기기 (교사 화면을 TV로 보여줄 때)</label>
-        ${ui.hideTally ? '' : tallyHTML(vote.liveTally, vote.votedCount)}`;
+        <div class="form compact">${liveSelectHTML(st)}</div>
+        ${vote.liveTally ? tallyHTML(vote.liveTally, vote.votedCount) : '<p class="muted small">득표 현황을 숨기는 중입니다. 마감 후 결과가 공개됩니다.</p>'}`;
     }
     if (vote?.status === 'tie') {
-      vc += `<p><b>동점입니다.</b> 후보: ${vote.tieCells.map(cellLabel).join(', ')}</p><div class="row-btns wrap">${vote.tieCells
-        .map((c) => `<button class="btn" data-act="h" data-type="resolveTie" data-cell="${c}" ${playing ? '' : 'disabled'}>${cellLabel(c)}로 결정</button>`)
-        .join('')}</div><div class="row-btns"><button class="btn primary" data-act="h" data-type="runoff" ${playing ? '' : 'disabled'}>동점 후보로 재투표</button><button class="btn" data-act="h" data-type="startVote" ${playing ? '' : 'disabled'}>전체 다시 투표</button></div>`;
+      const dis = playing ? '' : 'disabled';
+      const counts = vote.tieCells.map((c) => `${cellLabel(c)}(${st.lastVoteResult?.tally.find((t) => t.cell === c)?.count ?? 0}표)`).join(', ');
+      vc += `<p><b>동점입니다.</b> ${counts}</p><p class="muted small">어떻게 정할지 선택하세요.</p>
+        <div class="tie-options">
+          <button class="btn" data-act="h" data-type="startVote" ${dis}>① 전체 다시 투표<small>모든 빈 자리 대상</small></button>
+          <button class="btn primary" data-act="h" data-type="runoff" ${dis}>② 동점 후보로 재투표<small>${vote.tieCells.map(cellLabel).join(', ')} 중에서</small></button>
+          <button class="btn" data-act="h" data-type="randomTie" ${dis}>③ 무작위로 결정<small>동점 후보 중 하나를 랜덤으로</small></button>
+        </div>`;
     }
     if (vote?.status === 'noVotes') vc += `<p>아무도 투표하지 않았습니다.</p><button class="btn primary" data-act="h" data-type="startVote" ${playing ? '' : 'disabled'}>다시 투표하기</button>`;
     if (playing && vote?.status !== 'tie') vc += `<button class="btn small ${ui.directMode ? 'active-toggle' : 'ghost-btn'}" data-act="toggleDirect">${ui.directMode ? '직접 두기 취소' : '투표 없이 학생 돌 직접 두기'}</button>`;
     vc += '</section>';
+  }
+  if (phase === 'lobby') {
+    vc = `<section class="card"><h3>게임 준비</h3><div class="form compact">${colorSelectHTML(st, false)}${liveSelectHTML(st)}</div>
+      <p class="muted small">현재: 학생 팀 ${st.settings.studentColor === 'B' ? '흑돌 → 학생이 먼저 둡니다' : '백돌 → 선생님이 먼저 둡니다'}.</p></section>`;
   }
   patch('t-vote', vc);
   patch('t-result', vote?.status === 'open' ? '' : voteResultHTML(st.lastVoteResult));
@@ -1797,8 +1857,9 @@ function renderTeacher(force = false) {
   } else {
     panel += `<div class="form">
       <label>학생 투표 시간<select data-change="voteSeconds">${CONFIG.voteSecondsOptions.map((s) => `<option value="${s}" ${s === st.settings.voteSeconds ? 'selected' : ''}>${s}초</option>`).join('')}</select></label>
-      <label>먼저 두는 팀 (흑돌)<select data-change="firstTeam" ${phase === 'lobby' ? '' : 'disabled'}><option value="teacher" ${st.settings.firstTeam === 'teacher' ? 'selected' : ''}>선생님 팀</option><option value="students" ${st.settings.firstTeam === 'students' ? 'selected' : ''}>학생 팀</option></select></label>
-      ${phase === 'lobby' ? '' : '<p class="muted small">선공 팀은 게임 시작 전에만 바꿀 수 있습니다.</p>'}
+      ${colorSelectHTML(st, phase !== 'lobby')}
+      ${phase === 'lobby' ? '' : '<p class="muted small">돌 색은 게임 시작 전(대기 중)에만 바꿀 수 있습니다. 초기화하면 다시 고를 수 있습니다.</p>'}
+      ${liveSelectHTML(st)}
       <label class="check"><input type="checkbox" data-change="autoStartVote" ${st.settings.autoStartVote ? 'checked' : ''}> 선생님이 두고 나면 학생 투표 자동 시작</label>
       <p class="muted small">투표 시간 변경은 다음 투표부터 적용됩니다.</p></div>`;
   }
@@ -1854,19 +1915,20 @@ function renderStudent(force = false) {
   S.view = st;
 
   let status;
-  if (st.phase === 'lobby') status = ['idle', '곧 게임이 시작됩니다', '선생님이 게임을 시작할 때까지 기다려 주세요.'];
+  if (st.phase === 'lobby') status = ['idle', '곧 게임이 시작됩니다', `이번 게임에서 학생 팀은 ${st.settings.studentColor === 'B' ? '흑돌(먼저 둠)' : '백돌'}입니다.`];
   else if (st.phase === 'ended') status = ['end', resultText(st.result), '선생님이 새 게임을 시작하면 자동으로 이어집니다.'];
   else if (st.phase === 'paused') status = ['paused', '⏸ 일시정지', '선생님이 게임을 잠시 멈췄습니다.'];
   else if (st.turn === 'teacher') status = ['teacher', '선생님 차례입니다', '선생님이 돌을 놓을 때까지 기다려 주세요.'];
   else if (voteOpen) status = ['vote', vote.round > 1 ? '재투표 중! 후보 중 하나를 고르세요' : '투표 중! 원하는 자리를 누르세요', '시간 안에는 몇 번이든 바꿀 수 있어요.'];
-  else if (vote?.status === 'tie') status = ['paused', '동점입니다!', '선생님이 결정하거나 재투표를 진행합니다.'];
+  else if (vote?.status === 'tie') status = ['paused', '동점입니다!', '선생님이 다시 투표할지, 무작위로 정할지 선택합니다.'];
   else if (vote?.status === 'noVotes') status = ['paused', '투표한 사람이 없습니다', '선생님이 다음 진행을 결정합니다.'];
   else status = ['idle', '학생 팀 차례입니다', '곧 투표가 시작됩니다.'];
   patch('s-banner', `<div class="status-banner tone-${status[0]}"><div><strong>${esc(status[1])}</strong><span>${status[2]}</span></div>${vote?.status === 'open' ? countdownHTML() : ''}</div>`);
 
   const marks = {};
+  if (voteOpen && vote.liveTally) for (const t of vote.liveTally) marks[t.cell] = { text: t.count }; // 교사가 '모두 표시'로 설정한 경우만
   if (vote?.status === 'tie' && st.lastVoteResult) for (const t of st.lastVoteResult.tally) if (vote.tieCells.includes(t.cell)) marks[t.cell] = { text: t.count, tone: 'tie' };
-  patch(
+  patchBoard(
     's-board',
     boardSVG({
       role: 'student',
@@ -1886,11 +1948,20 @@ function renderStudent(force = false) {
       shownCell !== null
         ? `<div class="my-vote"><span>내 선택: <b class="big-label">${cellLabel(shownCell)}</b></span><span class="muted small">다른 교차점을 누르면 투표가 변경됩니다.</span><button class="btn small ghost-btn" data-act="unvote">투표 취소</button></div>`
         : `<div class="my-vote"><b>돌을 놓고 싶은 교차점을 누르세요.</b>${vote.candidates ? ' (점선 표시된 후보 중에서 선택)' : ''}</div>`;
-    mv += `<p class="muted small center">다른 친구들의 투표 내용은 투표가 끝난 뒤에 공개됩니다. 투표 ${vote.votedCount}명 참여</p>`;
+    mv += vote.liveTally
+      ? `<p class="muted small center">선생님 설정에 따라 실시간 득표 현황이 공개 중입니다 (아직 확정 아님). 투표 ${vote.votedCount}명 참여</p>`
+      : `<p class="muted small center">다른 친구들의 투표 내용은 투표가 끝난 뒤에 공개됩니다. 투표 ${vote.votedCount}명 참여</p>`;
   }
   patch('s-myvote', mv);
-  patch('s-teams', `<h3>팀 정보</h3><div class="teams">${teamTag('teacher', st.teamColor)}<span class="vs">VS</span>${teamTag('students', st.teamColor)}</div><p class="muted small">나는 학생 팀입니다. 총 ${st.moves.length}수 진행</p>`);
-  patch('s-result', voteOpen ? '' : voteResultHTML(st.lastVoteResult));
+  patch('s-teams', `<h3>팀 정보</h3><div class="teams">${teamTag('teacher', st.teamColor)}<span class="vs">VS</span>${teamTag('students', st.teamColor)}</div><p class="muted small">나는 학생 팀(${st.teamColor.students === 'B' ? '흑돌, 먼저 둠' : '백돌, 나중에 둠'})입니다. 총 ${st.moves.length}수 진행</p>`);
+  patch(
+    's-result',
+    voteOpen
+      ? vote.liveTally
+        ? `<section class="card"><h3>실시간 득표 현황 <span class="badge">확정 전</span></h3>${tallyHTML(vote.liveTally, vote.votedCount)}</section>`
+        : ''
+      : voteResultHTML(st.lastVoteResult),
+  );
   patch('s-moves', movesHTML(st.moves));
   patch('s-overlay', S.ui.overlayHiddenFor === st.gameNo ? '' : overlayHTML(st));
   tickCountdowns();
@@ -1959,7 +2030,7 @@ document.addEventListener('click', async (e) => {
       break;
     }
     case 'confirmMove': {
-      const type = Host.mode === 'place' ? 'place' : Host.mode === 'tie' ? 'resolveTie' : 'placeForStudents';
+      const type = Host.mode === 'place' ? 'place' : 'placeForStudents';
       if (Host.act(type, { cell: Host.ui.selected })) Host.ui.selected = null;
       renderTeacher();
       break;
@@ -2024,12 +2095,9 @@ document.addEventListener('change', (e) => {
   const el = e.target.closest('[data-change]');
   if (!el) return;
   const key = el.dataset.change;
-  if (key === 'hideTally') {
-    Host.ui.hideTally = el.checked;
-    return renderTeacher();
-  }
   if (key === 'voteSeconds') Host.act('settings', { voteSeconds: Number(el.value) });
-  if (key === 'firstTeam') Host.act('settings', { firstTeam: el.value });
+  if (key === 'studentColor') Host.act('settings', { studentColor: el.value });
+  if (key === 'liveTally') Host.act('settings', { liveTally: el.value });
   if (key === 'autoStartVote') Host.act('settings', { autoStartVote: el.checked });
 });
 
@@ -2049,7 +2117,6 @@ async function onBoardClick(svg, e) {
   if (svg.dataset.role === 'teacher') {
     const st = Host.view;
     if (!Host.mode || st.board[cell] !== null) return;
-    if (Host.mode === 'tie' && !st.vote.tieCells.includes(cell)) return;
     Host.ui.selected = cell;
     return renderTeacher();
   }
